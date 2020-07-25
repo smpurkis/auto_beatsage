@@ -1,19 +1,20 @@
 import asyncio
 import json
+import time
 from pathlib import Path
 
-import aiohttp
+import httpx
 import requests
 from pathvalidate import sanitize_filename
 from sclib import SoundcloudAPI
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.support.ui import WebDriverWait
-import time
 
-quest_local_ip = Path("settings.txt").read_text()
+
+def get_sanitized_filename(title):
+    filename = sanitize_filename(f"{title}".replace(" ", "_"))
+    if len(filename) > 150:
+        filename = filename[:150]
+    filename = filename + ".zip"
+    return filename
 
 
 # Beatsage download functions
@@ -36,30 +37,33 @@ def get_song_url(url):
 
 
 async def download_url(sess, url, save_path, chunk_size=128):
-    r = await sess.get(url)
-    print(r, "Beginning download")
-    assert r.status == 200
-    with save_path.open("wb") as fd:
-        while True:
-            chunk = await r.content.read(chunk_size)
-            if not chunk:
-                break
-            fd.write(chunk)
-    print(f"Level saved at: {save_path}")
+    async with sess.stream("get", url) as r:
+        print(r, "Beginning download")
+        assert r.status_code == 200
+        with save_path.open("wb") as fd:
+            async for chunk in r.aiter_bytes():
+                if not chunk:
+                    break
+                fd.write(chunk)
+        print(f"Level saved at: {save_path}")
 
 
 async def get_details(sess, url):
     print(f"Getting details of: {url}")
 
     data = {"youtube_url": url}
-    rp = await sess.post("https://beatsage.com/youtube_metadata", data=json.dumps(data))
-    if rp.status == 429:
-        seconds_to_wait = 120
-        print(f"Too many requests detected, waiting {seconds_to_wait} seconds")
-        time.sleep(seconds_to_wait)
+    for i in range(3):
         rp = await sess.post("https://beatsage.com/youtube_metadata", data=json.dumps(data))
-    assert rp.status == 200
-    video_metadata = json.loads(await rp.text())
+        if rp.status_code == 429:
+            seconds_to_wait = 60
+            print(f"Too many requests detected, waiting {seconds_to_wait} seconds")
+            time.sleep(seconds_to_wait)
+            rp = await sess.post("https://beatsage.com/youtube_metadata", data=json.dumps(data))
+        if rp.status_code != 200:
+            continue
+        else:
+            break
+    video_metadata = json.loads(rp.text)
 
     video_metadata.get("title")
     return video_metadata
@@ -77,64 +81,67 @@ async def get_level(sess, video_data, upload=False):
               "events": "DotBlocks,Obstacles",
               "environment": "DefaultEnvironment",
               "system_tag": "v2"}
-    data = aiohttp.FormData()
-    for key in fields.keys():
-        data.add_field(name=key, value=fields.get(key))
+    data = fields
+    # data = aiohttp.FormData()
+    # for key in fields.keys():
+    #     data.add_field(name=key, value=fields.get(key))
     rp = await sess.post("https://beatsage.com/beatsaber_custom_level_create", data=data)
-    assert rp.status == 200
+    assert rp.status_code == 200
 
-    content = json.loads(await rp.text())
+    content = json.loads(rp.text)
     download_id = content.get("id")
     still_pending = True
     print("Pending level download")
     while still_pending:
         await asyncio.sleep(30)
         rp = await sess.get(f"https://beatsage.com/beatsaber_custom_level_heartbeat/{download_id}")
-        assert rp.status == 200
-        content = json.loads(await rp.text())
+        assert rp.status_code == 200
+        content = json.loads(rp.text)
         status = content.get("status")
         if status.lower() == "done":
             break
 
-    filename = sanitize_filename(f"{video_metadata.get('title')}_by_{video_metadata.get('artist')}".replace(" ", "_"))
-    if len(filename) > 150:
-        filename = filename[:150]
-    filename = filename + ".zip"
+    filename = get_sanitized_filename(video_metadata.get('title'))
     download_path = Path("levels", filename)
+    level_folder = Path("levels")
+    if not level_folder.exists():
+        level_folder.mkdir()
     await download_url(sess, f"https://beatsage.com/beatsaber_custom_level_download/{download_id}", download_path)
     if upload:
         file_path = Path(download_path)
         await upload_to_quest(sess, file_path)
-    return download_path
+    return {video_metadata.get("title"): download_path}
 
 
-async def upload_to_quest(sess, file_path):
+async def upload_to_quest(sess, file_path, quest_local_ip):
     assert file_path.exists() and file_path.is_file()
 
     client_exceptions = (
-        aiohttp.ClientResponseError,
-        aiohttp.ClientConnectionError,
-        aiohttp.ClientPayloadError,
         asyncio.TimeoutError,
+        httpx.ConnectTimeout
     )
     while True:
         try:
-            r = await sess.get(f"http://{quest_local_ip}:50000/main/upload")
+            await sess.get(f"http://{quest_local_ip}:50000/main/upload")
             break
         except client_exceptions:
             print("Trying to find Quest to upload to")
             await asyncio.sleep(10)
 
-    options = Options()
-    options.headless = True
-    driver = webdriver.Chrome(executable_path="/usr/bin/chromedriver", options=options)
+    files = {"name": "file", "filename": file_path.name, "file": file_path.open("rb")}
+    rp = await sess.post(f"http://{quest_local_ip}:50000/host/beatsaber/upload", files=files)
+    assert rp.status_code == 204
 
-    driver.get(f"http://{quest_local_ip}:50000/main/upload")
-    driver.find_element(By.CSS_SELECTOR, "input").send_keys(file_path.absolute().__str__())
-    WebDriverWait(driver, 300).until(EC.presence_of_element_located((By.CSS_SELECTOR, ".toast-message")))
-    driver.find_element(By.CSS_SELECTOR, ".toast-message").click()
-    print("Finished upload")
-    driver.quit()
+    # options = Options()
+    # options.headless = True
+    # driver = webdriver.Chrome(executable_path="/usr/bin/chromedriver", options=options)
+    #
+    # driver.get(f"http://{quest_local_ip}:50000/main/upload")
+    # driver.find_element(By.CSS_SELECTOR, "input").send_keys(file_path.absolute().__str__())
+    # WebDriverWait(driver, 300).until(EC.presence_of_element_located((By.CSS_SELECTOR, ".toast-message")))
+    # driver.find_element(By.CSS_SELECTOR, ".toast-message").click()
+    # print("Finished upload")
+    # driver.quit()
 
 
 # Quest upload functions
@@ -145,15 +152,16 @@ def commit_to_quest(quest_local_ip):
 
 
 async def run_tasks(todo, function, **kwargs):
-    connector = aiohttp.TCPConnector(limit_per_host=2, limit=3)
-    sess = aiohttp.ClientSession(connector=connector)
+    # connector = aiohttp.TCPConnector(limit_per_host=2, limit=3)
+    # sess = aiohttp.ClientSession(connector=connector)
+    sess = httpx.AsyncClient(timeout=600)
     semaphore = asyncio.Semaphore(5)
     async with semaphore:
         tasks = [function(sess, elem, **kwargs) for elem in todo]
         for task in tasks:
             print(task)
         results = await asyncio.gather(*tasks)
-    await sess.close()
+    # await sess.close()
     return results
 
 
@@ -178,17 +186,22 @@ def async_get_details(song_urls):
 def async_get_levels(song_urls, video_metadatas):
     loop = asyncio.new_event_loop()
     video_data_list = list(zip(song_urls, video_metadatas))
-    loop.run_until_complete(run_tasks(video_data_list, get_level, upload=False))
+    download_paths = loop.run_until_complete(run_tasks(video_data_list, get_level, upload=False))
+    return download_paths
+
+
+def async_upload_levels_to_quest(level_paths, quest_local_ip):
+    loop = asyncio.new_event_loop()
+    loop.run_until_complete(run_tasks(level_paths, upload_to_quest, quest_local_ip=quest_local_ip))
 
 
 def main():
-    song_urls = get_song_urls()
-
-    loop = asyncio.get_event_loop()
-    video_metadatas = loop.run_until_complete(run_tasks(song_urls, get_details))
-    video_data_list = list(zip(song_urls, video_metadatas))
-    loop.run_until_complete(run_tasks(video_data_list, get_level, upload=True))
-    commit_to_quest(quest_local_ip=quest_local_ip)
+    file_path = Path(
+        "/home/sam/PycharmProjects/auto_beatsage/levels/Echo_(feat._Tauren_Wells)__Live__Elevation_Worship.zip")
+    quest_local_ip = "192.168.1.38"
+    files = {"name": "file", "filename": file_path.name, "file": file_path.open("rb")}
+    rp = httpx.post(f"http://{quest_local_ip}:50000/host/beatsaber/upload", files=files)
+    print(rp)
 
 
 if __name__ == "__main__":

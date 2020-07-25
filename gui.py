@@ -1,23 +1,25 @@
 import threading
-import regex as re
+import time
+from pathlib import Path
 
-# from kivy.app import App
-from kivymd.app import MDApp as App
+import regex as re
+from kivy.app import App
 from kivy.config import Config
 from kivy.core.window import Window
+from kivy.lang.builder import Builder
 from kivy.uix.button import Button
 # from kivymd.uix.button import MDFillRoundFlatButton as Button
 from kivy.uix.gridlayout import GridLayout
+# from kivymd.app import MDApp as App
+from kivy.uix.image import AsyncImage
+from kivy.uix.label import Label
+from kivy.uix.popup import Popup
 from kivy.uix.scrollview import ScrollView
 from kivy.uix.spinner import Spinner
 from kivy.uix.textinput import TextInput
-from kivymd.uix.textfield import MDTextField
-from kivy.uix.popup import Popup
-from kivy.uix.label import Label
-from kivy.metrics import dp
-from kivy.lang.builder import Builder
 
-from auto_beatsage_gui_version import async_get_details, async_get_levels, get_song_urls, commit_to_quest
+from auto_beatsage_gui_version import async_upload_levels_to_quest, async_get_details, async_get_levels, get_song_urls, \
+    get_sanitized_filename, commit_to_quest
 
 Config.set('input', 'mouse', 'mouse,multitouch_on_demand')
 
@@ -29,8 +31,10 @@ Builder.load_string('''
     height: 40
     size_hint_y: None
 <WrapSpinner>:
+    sync_height: True
     halign: "center"
     font_size: 15
+    height: 40
     text_size : self.width, None
     height: self.texture_size[1]
 ''')
@@ -42,17 +46,25 @@ class WrapButton(Button):
 
 class WrapSpinner(Spinner):
     def __init__(self, **kwargs):
+        self.level_path = None
+        self.status = kwargs.get("status", None)
         self.details = kwargs.get("details", None)
         self.title = kwargs.get("title", None)
+        kwargs.pop("status")
         kwargs.pop("details")
         kwargs.pop("title")
         super().__init__(**kwargs)
 
 
-
 class GUI(App):
     def build(self):
-        self.theme_cls.theme_style = "Dark"
+        # self.theme_cls.theme_style = "Dark"
+        print(Path("images", "cat_loader.gif").absolute().__str__())
+        assert Path("images", "cat_loader.gif").exists()
+        self.loading_gif = AsyncImage(source=Path("images", "cat_loader.gif").__str__(),
+                                      anim_delay=0.03,
+                                      mipmap=True)
+        self.popup = None
 
         self.main_layout = GridLayout(cols=2)
 
@@ -117,13 +129,25 @@ class GUI(App):
     def details_thread(self, instance):
         threading.Thread(None, target=self.get_details).start()
 
+    def loading_popup(self, title="Loading"):
+        if self.popup is None:
+            self.popup = Popup(title=title,
+                               content=self.loading_gif,
+                               size_hint=(None, None), size=(400, 200))
+            self.popup.bind(on_press=self.popup.dismiss)
+        else:
+            self.popup.title = title
+        self.popup.open()
+
     def get_details(self):
+        self.loading_popup(title="Loading Song Details")
         song_urls = self.textinput.text.split("\n")
         self.song_urls = get_song_urls(song_urls)
         print(self.song_urls)
         details = async_get_details(tuple(self.song_urls))
         for det in details:
             spinner = WrapSpinner(
+                status="Details Received",
                 details=det,
                 title=det.get("title"),
                 text=det.get("title"),
@@ -131,19 +155,41 @@ class GUI(App):
                         f'Uploader: {det.get("uploader")}',
                         f'Platform: {det.get("extractor")}',
                         f'View Count: {det.get("view_count")}',
-                        f'Like Count: {det.get("like_count")}'),
-                size_hint_y=None, height=40)
-            self.songs[det.get("title")] = spinner
-            spinner.bind(on_touch_down=self.get_text)
-            spinner.bind(text=self.show_selected_value)
-            self.rhs.add_widget(spinner)
+                        f'Like Count: {det.get("like_count")}',),
+                size_hint_y=None, height=40, background_color=[1, 0, 0, 1])
+            if det.get("title") not in self.songs.keys():
+                self.songs[det.get("title")] = spinner
+                spinner.bind(on_touch_down=self.get_text)
+                spinner.bind(text=self.show_selected_value)
+                self.rhs.add_widget(spinner)
+        self.check_status()
+        self.popup.dismiss()
+
+    def check_status(self, completed=False):
+        for song in self.songs.values():
+            if completed:
+                self.songs.get(song.title).status = "Level Synced"
+                self.songs.get(song.title).background_color = [0, 1, 0, 1]
+            else:
+                level_file = Path("levels", get_sanitized_filename(song.title))
+                if level_file.exists() and level_file.is_file():
+                    self.songs.get(song.title).status = "Level Downloaded"
+                    self.songs.get(song.title).background_color = [1, 0.65, 0, 1]
+                    self.songs.get(song.title).level_path = level_file
 
     def levels_thread(self, instance):
         threading.Thread(None, target=self.get_levels).start()
 
     def get_levels(self):
-        details = [d for d in self.songs.values()]
-        async_get_levels(self.song_urls, details)
+        self.loading_popup("Downloading Levels (will take 2-5 minutes per song)")
+        details = [song.details for song in self.songs.values() if song.status == "Details Received"]
+        level_paths = async_get_levels(self.song_urls, details)
+        for d in level_paths:
+            title = list(d.keys())[0]
+            level_path = d[title]
+            self.songs[title].level_path = level_path
+        self.check_status()
+        self.popup.dismiss()
 
     def upload_commit_thread(self, instance):
         if self.quest_local_ip is None:
@@ -152,10 +198,17 @@ class GUI(App):
                           size_hint=(None, None), size=(400, 200))
             popup.open()
         else:
-            threading.Thread(None, target=self.get_levels).start()
+            threading.Thread(None, target=self.upload_commit).start()
 
     def upload_commit(self):
-        commit_to_quest(quest_local_ip=self.quest_local_ip)
+        self.loading_popup("Committing to Quest")
+        level_paths = [song.level_path for song in self.songs.values() if
+                       song.status in ["Level Downloaded", "Level Synced"]]
+        async_upload_levels_to_quest(level_paths, quest_local_ip=self.quest_local_ip)
+        time.sleep(1)
+        commit_to_quest(self.quest_local_ip)
+        self.check_status(completed=True)
+        self.popup.dismiss()
 
 
 if __name__ == '__main__':
