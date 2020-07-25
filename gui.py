@@ -18,7 +18,7 @@ from kivy.uix.scrollview import ScrollView
 from kivy.uix.spinner import Spinner
 from kivy.uix.textinput import TextInput
 
-from auto_beatsage_gui_version import async_upload_levels_to_quest, async_get_details, async_get_levels, get_song_urls, \
+from utils import async_upload_levels_to_quest, async_get_details, async_get_levels, get_song_urls, \
     get_sanitized_filename, commit_to_quest
 
 Config.set('input', 'mouse', 'mouse,multitouch_on_demand')
